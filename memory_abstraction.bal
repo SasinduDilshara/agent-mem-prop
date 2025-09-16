@@ -7,7 +7,7 @@ public type Memory isolated object {
     #
     # + sessionId - The ID associated with the memory
     # + return - An array of messages or an `ai:Error`
-    public isolated function get(string sessionId, ai:ChatMessage message) returns ai:ChatMessage[]|ai:MemoryError;
+    public isolated function get(string sessionId, ai:ChatMessage message) returns anydata[]|ai:MemoryError;
 
     # Adds a chat message to the memory.
     #
