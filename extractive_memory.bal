@@ -3,6 +3,7 @@ import ballerina/sql;
 import ballerinax/mongodb;
 import ballerinax/redis;
 
+# Record type to hold extracted facts associated with a session
 public type ExtractiveMemoryFact record {
     string sessionId;
     anydata[] facts;

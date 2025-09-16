@@ -3,6 +3,7 @@ import ballerinax/mongodb;
 import ballerinax/redis;
 import ballerina/sql;
 
+# Record type to hold static facts
 type StaticFact record {
     string 'key; 
     string value;
