@@ -47,25 +47,10 @@ type TrimLastMessagesConfiguration record {|
     int maxMemoryTokens = 500;
 |};
 
-# Configuration for deleting oldest messages when memory exceeds limits.
-type DeleteLastMessagesConfiguration record {|
-    # Maximum number of messages to retain after deletion
-    int maxMessageCount = 10;
-|};
-
-# Configuration defining STM overflow handling strategies and limits.
-type STMMemoryOverflowConfig record {|
-    # Maximum token count allocated for the memory
-    int maxMemoryTokenCount = 2000;
-    
-    # Strategy configuration for handling STM overflow
-    FlushToLTMConfiguration|STMSummarizeConfiguration
-        |TrimLastMessagesConfiguration|DeleteLastMessagesConfiguration flushSTMOverflowmemory = DEFAULT_FLUSH_CONFIG;
-|};
-
 # Type alias for supported database clients in agent memory storage.
 type AgentMemoryDbStore mongodb:Client|redis:Client|sql:Client;
 
+# Type representing facts stored in memory.
 type MemoryContent record {
     ai:ChatMessage[] chatMessages;
     StaticFact[] staticFacts;
@@ -85,7 +70,10 @@ public isolated class AgentMemory {
     private final map<ai:MemoryChatSystemMessage>|AgentMemoryDbStore systemMessageStore;
     
     # Configuration for handling memory overflow scenarios
-    private STMMemoryOverflowConfig filterConfig = {};
+    private STMMemoryOverflowConfig filterConfig;
+
+    # Maximum token count allocated for the memory
+    private int maxMemoryTokenCount;
 
     # Initializes the agent memory with configurable storage backends and overflow handling.
     #
@@ -95,10 +83,12 @@ public isolated class AgentMemory {
     public isolated function init(
                 map<ai:MemoryChatMessage[]>|AgentMemoryDbStore? messageStore = (), 
                 map<ai:MemoryChatSystemMessage>|AgentMemoryDbStore? systemMessageStore = (),
-                STMMemoryOverflowConfig? filterConfig = {}) {
+                FlushToLTMConfiguration|STMSummarizeConfiguration|TrimLastMessagesConfiguration? filterConfig = DEFAULT_FLUSH_CONFIG,
+                int maxMemoryTokenCount = 100000) {
         self.messageStore = messageStore ?: {};
         self.systemMessageStore = systemMessageStore ?: {};
         self.filterConfig = filterConfig ?: {};
+        self.maxMemoryTokenCount = maxMemoryTokenCount;
     }
 
     # Retrieves conversation history for a session, applying filtering and token limits.

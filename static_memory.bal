@@ -4,10 +4,7 @@ import ballerinax/redis;
 import ballerina/sql;
 
 # Record type to hold static facts
-type StaticFact record {
-    string 'key; 
-    string value;
-};
+type StaticFact anydata;
 
 # Static memory for storing unchanging facts and information about the agent.
 # This memory type is read-only and contains predefined knowledge that doesn't change during conversations.
@@ -26,10 +23,12 @@ public isolated class StaticMemory {
     # + name - Identifier for this memory instance
     # + maxTokens - Maximum tokens allowed in this memory
     public isolated function init(
+            StaticFact[] facts,
             mongodb:Client|redis:Client|sql:Client factStore, 
             string name = "static_memory") {
         self.name = name;
         self.factStore = factStore;
+        check self.insertFacts(facts);
     }
 
     # Static memory doesn't support deletion as it contains permanent facts.
@@ -72,7 +71,7 @@ public isolated class StaticMemory {
 
     # Inserts predefined facts into the database.
     # + return - Error if insertion fails, `nil` on success
-    private isolated function insertFacts() returns ai:MemoryError? {
+    private isolated function insertFacts(StaticFact[] facts) returns ai:MemoryError? {
         // Insert predefined facts into the database
         return;
     }

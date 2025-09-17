@@ -275,12 +275,7 @@ STM Chat Messages Array:
 </extractive_memory>
 
 <vector_memory>
-  Remote Work Policy Context:
-  - Policy discussion regarding eligibility criteria and application process
-  - Employee equipment provisions and company support for remote workers  
-  - International work restrictions and compliance requirements
-  - Manager approval process and dispute resolution procedures
-  - Form HR-101 application process and trial period requirements
+  - conversation history
 </vector_memory>
 </memory>
 ```
