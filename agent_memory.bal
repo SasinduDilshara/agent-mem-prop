@@ -1,150 +1,205 @@
 import ballerina/ai;
 import ballerina/sql;
-import ballerinax/mongodb;
-import ballerinax/redis;
 
-# Default prompt template for summarizing conversation history
-final readonly & ai:Prompt DEFAULT_SUMMARY_PROMPT = `Summarize the following conversation history, focusing on key information, decisions, and context that should be remembered for future interactions.`;
+# Default prompt template for the summarization strategy.
+final readonly & ai:Prompt DEFAULT_SUMMARY_PROMPT = `...`;
 
-# Default AI model provider instance
-ai:ModelProvider defaultModel = check ai:getDefaultModelProvider();
+# Enum representing the available overflow strategies for an Stm without an Ltm.
+public enum OverflowStrategy {
+    Summarize = "Summarize",
+    Trim = "Trim"
+}
 
-# Default configuration for STM summarization strategy
-final STMSummarizeConfiguration DEFAULT_FLUSH_CONFIG = {
-    modelProvider: defaultModel
-};
-
-# Configuration for flushing STM content to Long Term Memory blocks.
-type FlushToLTMConfiguration record {|
-    # Maximum ratio of STM tokens before triggering flush to LTM
-    decimal maxSTMTokenRatio = 0.5;
-    
-    # Whether to include persistent memory in system prompts
-    boolean isPersistMemoryInsertedIntoTheSystemPrompt = false;
-    
-    # Array of Long Term Memory blocks to add the flush content
-    Memory[] LTMemoryBlocks = [];
+# Configuration for summarizing Stm content when it overflows.
+public type SummarizeOverflowConfig record {|
+    Summarize 'strategy = Summarize;
+    # AI model provider for generating summaries. 
+    # If not provided, the default will be the model that use by the agent.
+    ai:ModelProvider modelProvider?;
+    # Prompt template for summarization.
+    ai:Prompt summarizationPrompt = DEFAULT_SUMMARY_PROMPT;
+    # Number of recent messages to include in the summarization context.
+    int numberOfMessagesToSummarize = 5;
 |};
 
-# Configuration for summarizing STM content when token limits are exceeded.
-type STMSummarizeConfiguration record {|
-    # Number of recent messages to include in summarization
-    int summaryMessageCount = 2;
-    
-    # AI model provider for generating summaries
-    ai:ModelProvider modelProvider;
-    
-    # Prompt template for summarization
-    ai:Prompt summaryPrompt = DEFAULT_SUMMARY_PROMPT;
-    
-    # Maximum tokens allowed in generated summary
-    int maxSummaryTokens?;
+# Configuration for trimming older messages when Stm is full.
+public type TrimOverflowConfig record {|
+    Trim 'strategy = Trim;
 |};
 
-# Configuration for trimming older messages when memory is full.
-type TrimLastMessagesConfiguration record {|
-    # Maximum tokens to keep after trimming operation
-    int maxMemoryTokens = 500;
+# A union type representing the available overflow strategies for an Stm without an Ltm.
+public type OverflowHandlingStrategy SummarizeOverflowConfig|TrimOverflowConfig;
+
+// --- Memory Content & Storage Types ---
+
+# Supported database clients for persist Stm memory storage.
+public type PersistStMemoryStore sql:Client;
+
+# The Stm message storage, either in-memory map or persistent DB client.
+public type MessageStore map<ai:ChatMessage[]>|PersistStMemoryStore;
+
+# Represents the consolidated content retrieved from memory for prompting the model.
+public type MemoryContent record {|
+    # The list of chat messages forming the conversational context.
+    record {
+        string role;
+        string content;
+    }[] messages;
+    # Static facts retrieved from Ltm (if available).
+    string[]? staticFacts;
+    # Facts extracted from the conversation, stored in Ltm (if available).
+    map<anydata>? extractedFacts;
+    # Results from a vector similarity search in Ltm (if available).
+    ai:QueryMatch[]? vectorMatches;
 |};
 
-# Type alias for supported database clients in agent memory storage.
-type AgentMemoryDbStore mongodb:Client|redis:Client|sql:Client;
+// --- Long-Term Memory (Ltm) ---
 
-# Type representing facts stored in memory.
-type MemoryContent record {
-    ai:ChatMessage[] chatMessages;
-    StaticFact[] staticFacts;
-    ExtractiveMemoryFact[] extractedFacts;
-    ai:QueryMatch[] vectorMatches;
-};
+# Represents the optional Long-Term Memory, a container for persistent knowledge blocks.
+# Its methods are designed to be called asynchronously.
+isolated class LongTermMemory {
+    # Storage for the pluggable memory blocks.
+    private final LtMemoryBlock[] memoryBlocks;
+    # Maximum token count for the aggregated long-term memory context.
+    private final int maxMemoryTokenCount = 2048;
 
-# Main agent memory class implementing Short Term Memory (STM) with overflow handling.
-# Manages active conversation memory and implements strategies for handling memory limits.
-public isolated class AgentMemory {
-    *ai:Memory;
-    
-    # Storage for chat messages, either in-memory map or database client
-    private final map<ai:MemoryChatMessage[]>|AgentMemoryDbStore messageStore;
-    
-    # Storage for system messages, either in-memory map or database client  
-    private final map<ai:MemoryChatSystemMessage>|AgentMemoryDbStore systemMessageStore;
-    
-    # Configuration for handling memory overflow scenarios
-    private STMMemoryOverflowConfig filterConfig;
-
-    # Maximum token count allocated for the memory
-    private int maxMemoryTokenCount;
-
-    # Initializes the agent memory with configurable storage backends and overflow handling.
-    #
-    # + messageStore - Storage backend for chat messages (in-memory map or database)
-    # + systemMessageStore - Storage backend for system messages (in-memory map or database)
-    # + filterConfig - Configuration for memory overflow handling strategies
-    public isolated function init(
-                map<ai:MemoryChatMessage[]>|AgentMemoryDbStore? messageStore = (), 
-                map<ai:MemoryChatSystemMessage>|AgentMemoryDbStore? systemMessageStore = (),
-                FlushToLTMConfiguration|STMSummarizeConfiguration|TrimLastMessagesConfiguration? filterConfig = DEFAULT_FLUSH_CONFIG,
-                int maxMemoryTokenCount = 100000) {
-        self.messageStore = messageStore ?: {};
-        self.systemMessageStore = systemMessageStore ?: {};
-        self.filterConfig = filterConfig ?: {};
-        self.maxMemoryTokenCount = maxMemoryTokenCount;
+    # Initializes the Ltm with a set of pluggable memory blocks.
+    # + memoryBlocks - An array of Ltm blocks (e.g., Static, Extractive, Vector).
+    public isolated function init(LongTermMemoryConfig ltmConfig) {
+        self.memoryBlocks = ltmConfig.memoryBlocks;
+        self.maxMemoryTokenCount = ltmConfig.maxMemoryTokenCount;
     }
 
-    # Retrieves conversation history for a session, applying filtering and token limits.
-    #
-    # + sessionId - Session identifier for memory isolation
-    # + message - Current message providing context for retrieval
-    # + return - Array of relevant conversation messages or memory error
-    public isolated function get(string sessionId, ai:ChatMessage message) returns ai:ChatMessage[]|MemoryContent|ai:MemoryError {
-        // Retrieve messages from storage (map or database) for the sessionId
-        // If the LTM blocks are configured, retrieve relevant messages for the sessionId from them as well
-        // Apply token counting and filtering based on `filterConfig`
-        // Return messages within token limits, prioritizing recent messages
+    # Retrieves relevant long-term context for a given session.
+    public isolated function get(string sessionId, ai:ChatMessage|ai:ChatMessage[] context, RetrieveOptions options = {}) returns MemoryContent|ai:MemoryError {
+        // Implementation to aggregate results from each memoryBlock.
+        // Ensure the total token count does not exceed self.maxMemoryTokenCount.
+        // If the limit is exceeded, prioritize memory blocks in order of static, extractive, then vector.
     }
 
-    # Stores a new message and handles memory overflow using configured strategy.
-    #
-    # + sessionId - Session identifier for memory isolation
-    # + message - New message to store in memory
-    # + return - Nil on success, memory error if storage or overflow handling fails
-    public isolated function update(string sessionId, ai:ChatMessage message) returns ai:MemoryError? {
-        // Add message to storage (map or database) for the sessionId
-        // Check token count against limits
-        // If over limit, execute overflow strategy (summarize, trim, delete, or flush to LTM) for the older messages
-        return;
+    # Updates the Ltm blocks with new information from the conversation.
+    public isolated function update(string sessionId, ai:ChatMessage|ai:ChatMessage[] context, UpdateOptions options = {}) returns ai:MemoryError? {
+        // Implementation to update each memoryBlock.
     }
 
-    # Deletes all stored messages and system messages for a specific session.
-    #
-    # + sessionId - Session identifier for which to clear all memory
-    # + return - Nil on successful deletion, memory error if operation fails
+    # Deletes all data for a specific session from all Ltm blocks.
     public isolated function delete(string sessionId) returns ai:MemoryError? {
-        // Clear messages from both messageStore and systemMessageStore
-        // If LTM blocks are configured, delete messages for the sessionId from them as well
+        // Implementation to delete from each memoryBlock.
+    }
+}
+
+// --- Short-Term Memory (Stm) ---
+
+# Represents the mandatory Short-Term Memory, managing the active conversation window.
+isolated class ShortTermMemory {
+    # Storage for active chat messages.
+    private final MessageStore messageStore;
+    # The configured strategy for handling overflow when no Ltm is present.
+    private final OverflowHandlingStrategy overflowStrategy;
+    # Maximum token count for the active conversation history.
+    private final int maxMemoryTokenCount;
+
+    # Initializes the Stm.
+    # + messageStore - The backend for storing messages (in-memory map or persist db client).
+    # + overflowStrategy - The strategy to use when Stm overflows and no Ltm is available. If Ltm is present, this parameter will be ignored.
+    # + maxMemoryTokenCount - The token limit that short term memory can holds.
+    public isolated function init(ShortTermMemoryConfig stmConfig = {}) {
+        self.messageStore = stmConfig.messageStore;
+        self.overflowStrategy = stmConfig.overflowStrategy;
+        self.maxMemoryTokenCount = stmConfig.maxMemoryTokenCount;
+    }
+
+    # Retrieves the active conversation history.
+    # + sessionId - Session ID
+    public isolated function get(string sessionId) returns ai:ChatMessage[]|ai:MemoryError {
+        // Implementation to retrieve current messages from self.messageStore.
+        return [];
+    }
+    
+    # Updates the Stm with a new message and handles overflow.
+    # + sessionId - Session ID
+    # + context - New message(s) to add
+    # + ltm - The optional Ltm instance. If provided, the overflow strategy will changes to move the data to Ltm.
+    public isolated function update(string sessionId, ai:ChatMessage|ai:ChatMessage[] context, LongTermMemory? ltm = ()) returns ai:MemoryError? {
+        // 1. Add the new message(s) to the messageStore.
+        // 2. Check if the total token count exceeds self.maxMemoryTokenCount.
+        // 3. If overflow occurs and no Ltm, apply the configured overflow strategy (summarize or trim).
+        // 4. If overflow occurs and Ltm exists, 
+        //    For each older message, 
+        //       if it already sent to the ltm, remove from Stm.
+        //       else, move it to Ltm using ltm.update()  
+        //    Stop when the Stm token count is within limits.
+        // 5. Initiate background process to update Ltm with new message(s) if Ltm exists.
         return;
     }
 
-    # Calculates approximate token count for an array of messages.
-    #
-    # + messages - Array of messages to count tokens for
-    # + return - Estimated token count
-    private isolated function calculateTokenCount(ai:MemoryChatMessage[] messages) returns int {
-        // Calculates approximate token count for an array of messages.
-        return 100;
+    # Deletes all messages for a specific session from the Stm.
+    public isolated function delete(string sessionId) returns ai:MemoryError? {
+        // Implementation to clear messages from self.messageStore.
+        return;
+    }
+}
+
+// --- Main Memory Orchestrator ---
+
+# Configuration for the Short-Term Memory of the agent.
+public type ShortTermMemoryConfig record {|
+    # Storage backend for Stm messages (in-memory map or persistent DB client).
+    MessageStore messageStore = {};
+    # Strategy for handling Stm overflow when no Ltm is present.
+    OverflowHandlingStrategy overflowStrategy = {'strategy: "Summarize"};
+    # Maximum token count for Stm.
+    int maxMemoryTokenCount = 2048;
+|};
+
+# Configuration for the agent's Long-Term Memory.
+public type LongTermMemoryConfig record {|
+    # An array of Ltm memory blocks (e.g., Static, Extractive, Vector).
+    LtMemoryBlock[] memoryBlocks;
+    # Maximum token count for the aggregated Ltm context.
+    int maxMemoryTokenCount = 2048;
+|};
+
+# The main memory orchestrator that combines Stm and optional Ltm.
+# This is the primary class that an AI agent would interact with.
+public isolated class AgentWorkingMemory {
+    *Memory;
+    private final ShortTermMemory stm;
+    private final LongTermMemory? ltm;
+
+    # Initializes the complete agent memory system.
+    # + stmConfig - Configuration for the Short-Term Memory of the agent.
+    # + ltmConfig - Optional configuration for the Long-Term Memory of th agent.
+    public isolated function init(ShortTermMemoryConfig stmConfig, LongTermMemoryConfig? ltmConfig = ()) {
+        self.stm = new ShortTermMemory(stmConfig);
+        if ltmConfig is LongTermMemoryConfig {
+            self.ltm = new LongTermMemory(ltmConfig);
+        }
     }
 
-    # Handles memory overflow using the configured strategy.
-    #
+    # Retrieves memory contents from both Stm and Ltm for prompting.
     # + sessionId - Session identifier
-    # + messages - Current messages that exceed token limits
-    # + return - Nil on success, error if overflow handling fails
-    private isolated function handleMemoryOverflow(string sessionId) returns ai:MemoryError? {
-        // Execute strategy based on flushSTMOverflowmemory type
-        // - Summarize: Use AI to create summary and replace old messages
-        // - Trim: Remove oldest messages keeping within limits  
-        // - Delete: Remove specified number of oldest messages
-        // - FlushToLTM: Move messages to Long Term Memory blocks
-        return;
+    # + context - Current message(s) for context-based retrieval, 
+    #             if context is not provided, all the memories related to the session will be retrieved.
+    # + options - Retrieval configuration options
+    # + return - Memory content or error
+    public isolated function get(string sessionId, ai:ChatMessage|ai:ChatMessage[]? context = (), RetrieveOptions options = {}) returns MemoryContent|ai:MemoryError {
+        // 1. Get the current conversation history from Stm.
+        // 2. If Ltm exists, get long-term context and merge it.
+    }
+
+    # Updates the memory system with a new message.
+    # + sessionId - Session identifier
+    # + context - Message(s) to add to memory
+    # + options - Update configuration options
+    # + return - Error if update fails, nil on success
+    public isolated function update(string sessionId, ai:ChatMessage|ai:ChatMessage[] context, UpdateOptions options = {}) returns ai:MemoryError? {
+        // Update the Stm with the new context. This will eventually trigger Ltm update (if Ltm configured) as a background process.
+    }
+
+    # Deletes all memory for a session from both Stm and Ltm.
+    # + sessionId - Session identifier
+    public isolated function delete(string sessionId) returns ai:MemoryError? {
+        // Deletes all memory for a session from both Stm and Ltm
     }
 }

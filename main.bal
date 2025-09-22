@@ -5,7 +5,6 @@ import ballerinax/ai.openai;
 import ballerinax/ai.pinecone;
 
 jdbc:Client sqlLiteClient = check new(...);
-jdbc:Client sqlLiteClient2 = check new(...);
 
 openai:ModelProvider modelProvider = check new(...);
 openai:EmbeddingProvider embeddingProvider = check new(...);
@@ -37,31 +36,18 @@ VectorMemory vectorLTMBlock = new(
     embeddingProvider = embeddingProvider
 );
 
-AgentMemory agentMemory = new(
-    messageStore = sqlLiteClient,
-    systemMessageStore = sqlLiteClient2,
-    filterConfig = {
-        maxSummaryTokens: 500,
-        modelProvider: modelProvider,
-        summaryMessageCount: 10
-    }
-);
-
-AgentMemory agentMemoryWithLTM = new(
-    messageStore = sqlLiteClient,
-    systemMessageStore = sqlLiteClient2,
-    filterConfig = {
-        maxSTMTokenRatio: 0.8,
-        LTMemoryBlocks: [
-            staticLTMBlock, extractiveLTMBlock, vectorLTMBlock
-        ]
-    }
-);
-
-
 public function main() {
 
     // Create an AI agent with the STM memory only. Agent will summarize older messages when the memory exceeds the token limit.
+
+    AgentWorkingMemory agentMemory = new(
+        stmConfig = {
+            messageStore: sqlLiteClient,
+            maxMemoryTokenCount: 2048,
+            overflowStrategy: {'strategy: Summarize}
+        }
+    );
+
     ai:Agent agent = check new(
         {
             model: modelProvider,
@@ -72,12 +58,24 @@ public function main() {
     );
 
     // Create AI Agent with STM and LTM memory. Agent will flush older messages to LTM when the STM memory exceeds the token limit.
+
+    AgentWorkingMemory agentMemoryWithLTM = new(
+        stmConfig = {
+            messageStore: sqlLiteClient,
+            maxMemoryTokenCount: 2048
+        },
+        ltmConfig = {
+            memoryBlocks: [staticLTMBlock, extractiveLTMBlock, vectorLTMBlock],
+            maxMemoryTokenCount: 2048
+        }
+    );
+
     ai:Agent agentWithLTM = check new(
         {
             model: modelProvider,
             systemPrompt: ...,
             tools: [...],
-            memory: agentMemory
+            memory: agentMemoryWithLTM
         }
     );
 }
